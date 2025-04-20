@@ -1,0 +1,151 @@
+
+import pandas as pd
+from sqlalchemy import create_engine
+import cx_Oracle
+import logging
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Oracle Instant Client path setup
+os.environ["PATH"] = r"C:\oracle\instantclient;" + os.environ["PATH"]
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+
+# Load environment variables
+dotenv_path = os.path.join(os.getcwd(), 'etl_pass_security.env')
+load_dotenv(dotenv_path)
+
+# Database credentials
+username = os.getenv('ORACLE_USERNAME')
+password = os.getenv('ORACLE_PASSWORD')
+host = os.getenv('ORACLE_HOST')
+port = os.getenv('ORACLE_PORT')
+service_name = os.getenv('ORACLE_SERVICE_NAME')
+
+# Create DSN and engine
+dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+engine = create_engine(f'oracle+cx_oracle://{username}:{password}@{dsn}')
+
+# Define columns for ITEM_MASTER
+ITEM_MASTER_COLUMNS = (
+    " item_id, item_name, d_sale_price, empty_price, vat_price, default_s_qty, item_r_units_id, "
+    "item_d_units_id, d_u_fact, truck_factor, op_r_unit_qty, op_d_unit_qty, op_value, item_type_id, "
+    "item_class_id, item_group_id, note, company_id, inactive, itemsc_id, itemgl_id, ver, oid, udt,"
+    " mdqfors, itma_tdpr, itma_mrpr, itma_csrt, lu_rate1, lu_rate2, op_date, actn_takn, hs_code, net_wt,"
+    " gross_wt, item_stnm, item_exst, idate, edate, iuser, euser, ics_rate")
+
+# Extract a single batch
+def extract_batch(table_name, start_date, end_date, offset, batch_size):
+    if table_name == 'ITEM_MASTER':
+        columns = ITEM_MASTER_COLUMNS
+    else:
+        logging.error(f"Unsupported table name: {table_name}")
+        return pd.DataFrame()
+
+    sql_query = f"""
+    WITH paged_data AS (
+        SELECT {columns}, ROW_NUMBER() OVER (ORDER BY OP_DATE) AS row_num
+        FROM {table_name}
+        WHERE OP_DATE BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY')
+        AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    )
+    SELECT {columns}
+    FROM paged_data
+    WHERE row_num > {offset} AND row_num <= {offset + batch_size}
+    """
+
+    logging.info(f"Extracting {table_name}: Offset {offset}")
+    try:
+        df = pd.read_sql(sql_query, con=engine)
+        return df
+    except Exception as e:
+        logging.error(f"Error extracting data: {e}")
+        return pd.DataFrame()
+
+# Transform function for ITEM_MASTER
+def transform_ITEM_MASTER(df):
+    # Date columns to be converted
+    date_cols = ['op_date', 'idate', 'edate', 'udt']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+            df[col] = df[col].fillna(pd.Timestamp("1970-01-01"))
+
+    # Numeric columns (float/int based)
+    numeric_cols = [
+        'd_sale_price', 'empty_price', 'vat_price', 'default_s_qty',
+        'd_u_fact', 'truck_factor', 'op_r_unit_qty', 'op_d_unit_qty',
+        'op_value', 'mdqfors', 'itma_tdpr', 'itma_mrpr', 'itma_csrt',
+        'lu_rate1', 'lu_rate2', 'net_wt', 'gross_wt', 'ics_rate'
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Text columns
+    text_cols = [
+        'item_id', 'item_name', 'note', 'actn_takn', 'hs_code',
+        'item_stnm', 'item_exst', 'iuser', 'euser'
+    ]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    # Boolean conversion if needed (e.g., inactive)
+    if 'inactive' in df.columns:
+        df['inactive'] = df['inactive'].map({'Y': True, 'N': False}).fillna(False)
+
+    # Drop duplicates based on item_id
+    if 'item_id' in df.columns:
+        df = df.drop_duplicates(subset='item_id', keep='first')
+
+    return df
+
+# Save final CSV
+def save_item_csv(df):
+    output_dir = r"D:/ETL DEMO WORK/DEMO"
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        path = os.path.join(output_dir, "ITEM.csv")
+        df.to_csv(path, index=False)
+        logging.info(f"Item data saved: {path}")
+    except Exception as e:
+        logging.error(f"Error saving item CSV: {e}")
+
+# Function to get total record count
+def get_total_records(table_name, start_date, end_date):
+    sql_query = f"""
+    SELECT COUNT(*)
+    FROM {table_name}
+    WHERE OP_DATE BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY')
+    AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    """
+    try:
+        total_records = pd.read_sql(sql_query, con=engine).iloc[0, 0]
+        return total_records
+    except Exception as e:
+        logging.error(f"Error fetching total records: {e}")
+        return 0
+
+# Main runner for ITEM_MASTER ETL
+def run_ITEM_MASTER_etl():
+    start_date = '01-01-2023'
+    end_date = '31-01-2023'
+    batch_size = 10000
+
+    total = get_total_records('ITEM_MASTER', start_date, end_date)
+    batches = []
+    for offset in range(0, total, batch_size):
+        batch_df = extract_batch('ITEM_MASTER', start_date, end_date, offset, batch_size)
+        if not batch_df.empty:
+            transformed = transform_ITEM_MASTER(batch_df)
+            batches.append(transformed)
+
+    final_df = pd.concat(batches, ignore_index=True) if batches else pd.DataFrame()
+    save_item_csv(final_df)
+
+if __name__ == "__main__":
+    run_ITEM_MASTER_etl()
