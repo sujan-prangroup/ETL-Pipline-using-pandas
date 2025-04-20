@@ -1,0 +1,247 @@
+# 1. IMPORTS & CONFIGURATION
+
+import pandas as pd
+from sqlalchemy import create_engine
+import cx_Oracle
+import logging
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Oracle client path
+os.environ["PATH"] = r"C:\oracle\instantclient;" + os.environ["PATH"]
+
+# Initialize Oracle Client
+cx_Oracle.init_oracle_client(lib_dir=r"C:\oracle\instantclient")
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+
+# Load credentials from .env file
+dotenv_path = os.path.join(os.getcwd(), 'etl_pass_security.env')
+load_dotenv(dotenv_path)
+
+# Get Oracle credentials
+username = os.getenv('ORACLE_USERNAME')
+password = os.getenv('ORACLE_PASSWORD')
+host = os.getenv('ORACLE_HOST')
+port = os.getenv('ORACLE_PORT')
+service_name = os.getenv('ORACLE_SERVICE_NAME')
+
+# DSN and engine creation
+dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+engine = create_engine(f'oracle+cx_oracle://{username}:{password}@{dsn}')
+
+
+# 2. COLUMN DEFINITIONS FOR BOTH TABLES
+
+MR_MASTER_COLUMNS = (
+    "mr_no, mr_trn, mr_trn_date, dist_id, mr_onacc_name, note, transferred, iuser, euser, idate, "
+    "edate, mcom_id, ver, oid, udt, mrbn_oid, acom_id, site, mr_inct, currency_code, exchange_rate, sub_dist_id"
+)
+
+MR_DETAIL_COLUMNS = (
+    "mr_no, mr_source_code, bank, cheque_no, pdate, mr_det_desc, amount, mr_line_no, iuser, euser, "
+    "idate, edate, mr_trn_date, ver, oid, udt, charge_bank, charge_ait, charge_other"
+)
+
+
+# 3. BATCH DATA EXTRACTOR
+
+def extract_batch(table_name, start_date, end_date, offset, batch_size):
+    if table_name == 'MR_MASTER':
+        columns = MR_MASTER_COLUMNS
+    elif table_name == 'MR_DETAIL':
+        columns = MR_DETAIL_COLUMNS
+    else:
+        logging.error(f"Unsupported table name: {table_name}")
+        return pd.DataFrame()
+
+    sql_query = f"""
+    WITH paged_data AS (
+        SELECT {columns}, ROW_NUMBER() OVER (ORDER BY mr_trn_date) AS row_num
+        FROM {table_name}
+        WHERE mr_trn_date BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY')
+        AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    )
+    SELECT {columns}
+    FROM paged_data
+    WHERE row_num > {offset} AND row_num <= {offset + batch_size}
+    """
+
+    logging.info(f"Extracting {table_name}: Offset {offset}")
+    try:
+        df = pd.read_sql(sql_query, con=engine)
+        return df
+    except Exception as e:
+        logging.error(f"Error extracting data: {e}")
+        return pd.DataFrame()
+
+
+# 4. TRANSFORMATION FUNCTIONS
+
+def transform_mr_detail(df):
+    # Handle dates
+    date_cols = ['idate', 'edate', 'pdate', 'mr_trn_date']
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+    df = df.dropna(subset=['idate', 'edate'])  # Still keep idate and edate mandatory
+
+    # Handle numbers
+    numeric_cols = ['amount', 'charge_bank', 'charge_ait', 'charge_other']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Clean text
+    text_cols = ['mr_no', 'mr_source_code', 'bank', 'cheque_no', 'mr_det_desc']
+    for col in text_cols:
+        df[col] = df[col].astype(str).str.strip()
+
+    # Clean users
+    df['iuser'] = df['iuser'].astype(str).str.strip()
+    df['euser'] = df['euser'].astype(str).str.strip()
+
+    return df
+
+
+def transform_mr_master(df):
+    # Handle dates
+    date_cols = ['mr_trn_date', 'idate', 'edate']
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+    df = df.dropna(subset=['idate', 'edate'])  # Optional to enforce
+
+    # Clean text
+    text_cols = ['mr_no', 'mr_onacc_name', 'note']
+    for col in text_cols:
+        df[col] = df[col].astype(str).str.strip()
+
+    # Clean users
+    df['iuser'] = df['iuser'].astype(str).str.strip()
+    df['euser'] = df['euser'].astype(str).str.strip()
+
+    return df
+
+
+# 5. JOIN DETAIL + MASTER
+
+def join_mr_data(detail_df, master_df):
+    # Rename for clarity
+    detail_df = detail_df.rename(columns={'idate': 'detail_idate', 'edate': 'detail_edate'})
+    master_df = master_df.rename(columns={'idate': 'master_idate', 'edate': 'master_edate'})
+
+    # Merge by mr_no
+    merged_df = pd.merge(
+        detail_df,
+        master_df,
+        on='mr_no',
+        how='left',
+        suffixes=('_detail', '_master')
+    )
+
+    # Merge columns with same meaning
+    for detail_col in merged_df.columns:
+        if detail_col.startswith('detail_'):
+            base_col = detail_col.replace('detail_', '')
+            master_col = f'master_{base_col}'
+            new_col_name = base_col
+            if master_col in merged_df.columns:
+                merged_df = merge_duplicate_columns(merged_df, detail_col, master_col, new_col_name)
+
+    return merged_df
+
+
+def merge_duplicate_columns(df, col1, col2, new_col_name):
+    if col1 in df.columns and col2 in df.columns:
+        if df[col1].equals(df[col2]):
+            df[new_col_name] = df[col1]
+            df.drop([col1, col2], axis=1, inplace=True)
+            logging.info(f"Merged columns '{col1}' and '{col2}' into '{new_col_name}'")
+        else:
+            logging.info(f"Columns '{col1}' and '{col2}' differ — not merged.")
+    return df
+
+
+# 6. SAVE TO CSV FILES
+
+def save_final_csvs(master_df, detail_df, merged_df):
+    output_dir = r"D:/ETL DEMO WORK/DEMO"
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        # Save individual files
+        master_df.to_csv(os.path.join(output_dir, "MR_MASTER.csv"), index=False)
+        detail_df.to_csv(os.path.join(output_dir, "MR_DETAIL.csv"), index=False)
+
+        # Define new desired column order (based on shared/important fields)
+        desired_order = [
+            'mr_no', 'mr_source_code', 'bank', 'cheque_no', 'pdate', 'amount',
+            'charge_bank', 'charge_ait', 'charge_other', 'mr_trn_date',
+            'dist_id', 'mr_onacc_name', 'note', 'transferred',
+            'currency_code', 'exchange_rate', 'site',
+            'iuser', 'euser'
+        ]
+        existing = [c for c in desired_order if c in merged_df.columns]
+        remaining = [c for c in merged_df.columns if c not in existing]
+        final_columns = existing + remaining
+
+        merged_df = merged_df[final_columns]
+        merged_df.to_csv(os.path.join(output_dir, "MERGED_MR_DATA.csv"), index=False)
+
+        logging.info(" All CSV files saved successfully.")
+    except Exception as e:
+        logging.error(f" Error saving CSV files: {e}")
+
+
+# 7. GET TOTAL RECORDS FOR BATCHING
+
+def get_total_records(table_name, start_date, end_date):
+    sql_query = f"""
+    SELECT COUNT(*) 
+    FROM {table_name}
+    WHERE mr_trn_date BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY')
+    AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    """
+    try:
+        return pd.read_sql(sql_query, con=engine).iloc[0, 0]
+    except Exception as e:
+        logging.error(f"Error counting records: {e}")
+        return 0
+
+
+# 8. MAIN ETL RUNNER
+
+def run_etl():
+    start_date = '01-01-2023'
+    end_date = '31-01-2023'
+    batch_size = 10000
+
+    # Extract & transform MR_MASTER
+    master_total = get_total_records('MR_MASTER', start_date, end_date)
+    master_batches = []
+    for offset in range(0, master_total, batch_size):
+        df = extract_batch('MR_MASTER', start_date, end_date, offset, batch_size)
+        if not df.empty:
+            master_batches.append(transform_mr_master(df))
+    master_df = pd.concat(master_batches, ignore_index=True) if master_batches else pd.DataFrame()
+
+    # Extract & transform MR_DETAIL
+    detail_total = get_total_records('MR_DETAIL', start_date, end_date)
+    detail_batches = []
+    for offset in range(0, detail_total, batch_size):
+        df = extract_batch('MR_DETAIL', start_date, end_date, offset, batch_size)
+        if not df.empty:
+            detail_batches.append(transform_mr_detail(df))
+    detail_df = pd.concat(detail_batches, ignore_index=True) if detail_batches else pd.DataFrame()
+
+    # Join both
+    merged_df = join_mr_data(detail_df, master_df) if not master_df.empty and not detail_df.empty else pd.DataFrame()
+
+    # Save all outputs
+    save_final_csvs(master_df, detail_df, merged_df)
+
+
+# 9. START ETL
+
+if __name__ == "__main__":
+    run_etl()
