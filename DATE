@@ -1,0 +1,31 @@
+import pandas as pd
+
+# Load the data from CSV file
+file_path = 'D:\\ETL DEMO WORK\\DEMO\\MERGED_CHALLAN_DATA.csv'  # Replace with your file path
+df = pd.read_csv(file_path)
+
+# Convert 'master_ch_date' to datetime format with automatic inference
+df['master_ch_date'] = pd.to_datetime(df['master_ch_date'], format='mixed', errors='coerce')
+
+# Drop rows where date conversion failed
+df = df.dropna(subset=['master_ch_date'])
+
+# Create new columns for date details
+date_info = pd.DataFrame({
+    'date_id': df['master_ch_date'].dt.strftime('%Y%m%d').astype(int),
+    'date': df['master_ch_date'].dt.date,
+    'year': df['master_ch_date'].dt.year,
+    'month': df['master_ch_date'].dt.month,
+    'fortnight': df['master_ch_date'].dt.day.apply(lambda x: 1 if x <= 15 else 2),
+    'day': df['master_ch_date'].dt.day,
+    'weekday': df['master_ch_date'].dt.day_name()
+})
+
+# Remove duplicates from the 'date_id' column
+date_info = date_info.drop_duplicates(subset=['date_id'])
+
+# Save the extracted data to a new CSV file
+output_path = 'D:\\ETL DEMO WORK\\DEMO\\DATE.csv' 
+date_info.to_csv(output_path, index=False)
+
+print(f"Date information saved to {output_path}")
