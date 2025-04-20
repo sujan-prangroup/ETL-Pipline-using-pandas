@@ -1,0 +1,182 @@
+import pandas as pd
+from sqlalchemy import create_engine
+import cx_Oracle
+import logging
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Set up Oracle client path
+os.environ["PATH"] = r"C:\oracle\instantclient;" + os.environ["PATH"]
+
+# Initialize Oracle Client
+#cx_Oracle.init_oracle_client(lib_dir=r"C:\oracle\instantclient")
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+
+# Load .env file
+dotenv_path = os.path.join(os.getcwd(), 'etl_pass_security.env')
+load_dotenv(dotenv_path)
+
+# Get Oracle credentials
+username = os.getenv('ORACLE_USERNAME')
+password = os.getenv('ORACLE_PASSWORD')
+host = os.getenv('ORACLE_HOST')
+port = os.getenv('ORACLE_PORT')
+service_name = os.getenv('ORACLE_SERVICE_NAME')
+
+# Create DSN and engine
+dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+engine = create_engine(f'oracle+cx_oracle://{username}:{password}@{dsn}')
+
+# DO_MASTER columns
+DO_MASTER_COLUMNS = (
+    "do_no, do_trn, do_date, delivery_date, dist_id, do_source_id, note, doc_ref, ref_amount, wh_id, iuser, "
+    "euser, idate, edate, condition, ver, oid, doma_acyl, udt, site, doma_seqn, domr_chk, doc_ref_type, confirm, "
+    "mr_no, delv_note"
+)
+
+# DO_DETAIL columns
+DO_DETAIL_COLUMNS = (
+    "do_no, do_line_no, item_id, qty, rate, s_qty, cancelled, iuser, euser, idate, edate, do_date, ver, oid, "
+    "dode_acyl, udt, pctdisc, dode_ruid, dode_duid, dode_dufq, dode_fcur, dode_fcrt, site, dode_seqn, action_taken, "
+    "dode_sisd, line_note, ref_line_no, aemp_text, cancel_qty, cancel_sqty, cancel_date, confirm_do, union_text, "
+    "sd_addr"
+)
+
+def extract_batch(table_name, start_date, end_date, offset, batch_size):
+    columns = DO_MASTER_COLUMNS if table_name == 'DO_MASTER' else DO_DETAIL_COLUMNS
+
+    sql_query = f"""
+    WITH paged_data AS (
+        SELECT {columns}, ROW_NUMBER() OVER (ORDER BY do_date) AS row_num
+        FROM {table_name}
+        WHERE do_date BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY') AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    )
+    SELECT {columns}
+    FROM paged_data
+    WHERE row_num > {offset} AND row_num <= {offset + batch_size}
+    """
+    logging.info(f"Extracting {table_name}: Offset {offset}")
+    try:
+        return pd.read_sql(sql_query, con=engine)
+    except Exception as e:
+        logging.error(f"Error extracting data from {table_name}: {e}")
+        return pd.DataFrame()
+
+def transform_do_detail(df):
+    date_cols = ['idate', 'edate', 'do_date', 'cancel_date']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    df.dropna(subset=['idate', 'edate'], inplace=True)
+
+    numeric_cols = ['rate', 'qty', 's_qty', 'cancel_qty', 'cancel_sqty']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    text_cols = ['do_no', 'item_id', 'line_note']
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    df['total_amount'] = df['rate'] * df['qty']
+
+    for user_col in ['iuser', 'euser']:
+        if user_col in df.columns:
+            df[user_col] = df[user_col].astype(str).str.strip()
+
+    return df
+
+def transform_do_master(df):
+    date_cols = ['do_date', 'idate', 'edate', 'delivery_date']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    df.dropna(subset=['do_date', 'idate', 'edate'], inplace=True)
+
+    text_cols = ['do_no', 'note', 'doc_ref']
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    if 'confirm' in df.columns:
+        df['confirm'] = df['confirm'].map({'Y': True, 'N': False})
+
+    for user_col in ['iuser', 'euser']:
+        if user_col in df.columns:
+            df[user_col] = df[user_col].astype(str).str.strip()
+
+    return df
+
+def join_do_data(detail_df, master_df):
+    detail_df = detail_df.rename(columns={'idate': 'detail_idate', 'edate': 'detail_edate'})
+    master_df = master_df.rename(columns={'idate': 'master_idate', 'edate': 'master_edate', 'do_date': 'master_do_date'})
+
+    merged_df = pd.merge(detail_df, master_df, on='do_no', how='left')
+
+    for detail_col in merged_df.columns:
+        if detail_col.startswith('detail_'):
+            base_col = detail_col.replace('detail_', '')
+            master_col = f'master_{base_col}'
+            if master_col in merged_df.columns:
+                merged_df = merge_duplicate_columns(merged_df, detail_col, master_col, base_col)
+
+    return merged_df
+
+def merge_duplicate_columns(df, col1, col2, new_col_name):
+    if col1 in df.columns and col2 in df.columns:
+        df[new_col_name] = df[col1].combine_first(df[col2])
+        df.drop([col1, col2], axis=1, inplace=True)
+        logging.info(f"Merged columns '{col1}' and '{col2}' into '{new_col_name}'")
+    return df
+
+def save_final_csvs(master_df, detail_df, merged_df):
+    output_dir = r"D:/ETL DEMO WORK/DEMO"
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        master_df.to_csv(os.path.join(output_dir, "DO_MASTER.csv"), index=False)
+        detail_df.to_csv(os.path.join(output_dir, "DO_DETAIL.csv"), index=False)
+
+        merged_df.to_csv(os.path.join(output_dir, "MERGED_DO_DATA.csv"), index=False)
+        logging.info("CSV files saved successfully.")
+    except Exception as e:
+        logging.error(f"Error saving CSVs: {e}")
+
+def get_total_records(table_name, start_date, end_date):
+    query = f"""
+    SELECT COUNT(*) FROM {table_name}
+    WHERE do_date BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY') AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    """
+    try:
+        return pd.read_sql(query, con=engine).iloc[0, 0]
+    except Exception as e:
+        logging.error(f"Failed to count records in {table_name}: {e}")
+        return 0
+
+def run_do_etl():
+    start_date = '01-01-2023'
+    end_date = '31-01-2023'
+    batch_size = 10000
+
+    master_total = get_total_records('DO_MASTER', start_date, end_date)
+    master_batches = [transform_do_master(extract_batch('DO_MASTER', start_date, end_date, offset, batch_size))
+                      for offset in range(0, master_total, batch_size)]
+    master_df = pd.concat(master_batches, ignore_index=True) if master_batches else pd.DataFrame()
+
+    detail_total = get_total_records('DO_DETAIL', start_date, end_date)
+    detail_batches = [transform_do_detail(extract_batch('DO_DETAIL', start_date, end_date, offset, batch_size))
+                      for offset in range(0, detail_total, batch_size)]
+    detail_df = pd.concat(detail_batches, ignore_index=True) if detail_batches else pd.DataFrame()
+
+    merged_df = join_do_data(detail_df, master_df) if not master_df.empty and not detail_df.empty else pd.DataFrame()
+    if merged_df.empty:
+        logging.warning("Merge skipped due to empty master or detail.")
+
+    save_final_csvs(master_df, detail_df, merged_df)
+
+if __name__ == "__main__":
+    run_do_etl()
