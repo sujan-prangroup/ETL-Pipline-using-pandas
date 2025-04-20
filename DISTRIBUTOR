@@ -1,0 +1,154 @@
+import pandas as pd
+from sqlalchemy import create_engine
+import cx_Oracle
+import logging
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+
+os.environ["PATH"] = r"C:\oracle\instantclient;" + os.environ["PATH"]
+
+# Initialize Oracle Client
+cx_Oracle.init_oracle_client(lib_dir=r"C:\oracle\instantclient")
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+
+# Load .env file from the current directory
+dotenv_path = os.path.join(os.getcwd(), 'etl_pass_security.env')
+load_dotenv(dotenv_path)
+
+# Get the values
+username = os.getenv('ORACLE_USERNAME')
+password = os.getenv('ORACLE_PASSWORD')
+host = os.getenv('ORACLE_HOST')
+port = os.getenv('ORACLE_PORT')
+service_name = os.getenv('ORACLE_SERVICE_NAME')
+
+# Create DSN and engine
+dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+engine = create_engine(f'oracle+cx_oracle://{username}:{password}@{dsn}')
+
+# Column definitions
+DISTRIBUTOR_MASTER_COLUMNS = (
+    " dist_id, dist_name, addr1, addr2, addr3, addr4, dist_zone_id,  "
+    "sales_zone_id, dist_route_id, dist_type_id, wh_id, opening, cancelled,  "
+    "dist_cat_id, mcom_id, gl_id, region_id, secdep, cr_lim, edate, cldate,  "
+    "ver, oid, udt, digr_text, domo_text, cur_bal, min_do_amnt, settled,  "
+    "domo_actv, domo_dtnm, iuser, euser, opdate, lu_rate1, lu_rate2, dist_cmfl, wh_apps, pl_id"
+)
+
+# Extract a single batch
+def extract_batch(table_name, start_date, end_date, offset, batch_size):
+    if table_name == 'DISTRIBUTOR_MASTER':
+        columns = DISTRIBUTOR_MASTER_COLUMNS
+    else:
+        logging.error(f"Unsupported table name: {table_name}")
+        return pd.DataFrame()
+
+    sql_query = f"""
+    WITH paged_data AS (
+        SELECT {columns}, ROW_NUMBER() OVER (ORDER BY edate) AS row_num
+        FROM {table_name}
+        WHERE edate BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY')
+        AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    )
+    SELECT {columns}
+    FROM paged_data
+    WHERE row_num > {offset} AND row_num <= {offset + batch_size}
+    """
+
+    logging.info(f"Extracting {table_name}: Offset {offset}")
+    try:
+        df = pd.read_sql(sql_query, con=engine)
+        return df
+    except Exception as e:
+        logging.error(f"Error extracting data: {e}")
+        return pd.DataFrame()
+
+# Transform function for DISTRIBUTOR_MASTER
+
+def transform_distributor_master(df):
+    date_cols = ['edate', 'cldate']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+            df[col] = df[col].fillna(0)  # Replace invalid/missing dates with 0
+    
+    numeric_cols = ['cr_lim', 'cur_bal', 'min_do_amnt']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df = df.dropna(subset=numeric_cols).copy()
+
+    text_cols = ['dist_name', 'addr1', 'addr2', 'addr3', 'addr4', 'digr_text', 'domo_text', 'iuser', 'euser']
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    bool_cols = ['cancelled', 'settled', 'domo_actv', 'wh_apps']
+    for col in bool_cols:
+        if col in df.columns:
+            df[col] = df[col].map({'Y': True, 'N': False})
+
+    # Ensure dist_id is unique — keep the first occurrence
+    if 'dist_id' in df.columns:
+        df = df.drop_duplicates(subset='dist_id', keep='first')        
+
+    # Convert 'dist_id' to numeric, coercing errors to NaN
+    df['dist_id'] = pd.to_numeric(df['dist_id'], errors='coerce')
+
+    # Count the number of rows that will be removed
+    outliers_count = len(df) - len(df[(df['dist_id'] > 0) & (df['dist_id'] < 9999999999)])
+
+    print(f"Number of rows to be removed: {outliers_count}")     
+
+    return df
+
+# Save final CSVs
+def save_distributor_csv(df):
+    output_dir = r"D:/ETL DEMO WORK/DEMO"
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        path = os.path.join(output_dir, "DISTRIBUTOR.csv")
+        df.to_csv(path, index=False)
+        logging.info(f"Distributor data saved: {path}")
+    except Exception as e:
+        logging.error(f"Error saving distributor CSV: {e}")
+
+# Function to get total record count
+def get_total_records(table_name, start_date, end_date):
+    sql_query = f"""
+    SELECT COUNT(*) 
+    FROM {table_name}
+    WHERE edate BETWEEN TO_DATE('{start_date}', 'DD-MM-YYYY')
+    AND TO_DATE('{end_date}', 'DD-MM-YYYY')
+    """
+    try:
+        total_records = pd.read_sql(sql_query, con=engine).iloc[0, 0]
+        return total_records
+    except Exception as e:
+        logging.error(f"Error fetching total records: {e}")
+        return 0
+
+# Main runner for distributor ETL
+def run_distributor_etl():
+    start_date = '01-01-2023'
+    end_date = '31-01-2023'
+    batch_size = 10000
+
+    total = get_total_records('DISTRIBUTOR_MASTER', start_date, end_date)
+    batches = []
+    for offset in range(0, total, batch_size):
+        batch_df = extract_batch('DISTRIBUTOR_MASTER', start_date, end_date, offset, batch_size)
+        if not batch_df.empty:
+            transformed = transform_distributor_master(batch_df)
+            batches.append(transformed)
+
+    final_df = pd.concat(batches, ignore_index=True) if batches else pd.DataFrame()
+    save_distributor_csv(final_df)
+
+if __name__ == "__main__":
+    run_distributor_etl()
